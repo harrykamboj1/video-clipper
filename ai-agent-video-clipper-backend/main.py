@@ -1,8 +1,12 @@
+import json
 import os
 import pathlib
+import subprocess
+import time
 import uuid
 import boto3
 import modal
+import whisperx
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi import Depends, HTTPException, status
 from pydantic import BaseModel
@@ -36,7 +40,41 @@ class AiPodcastClipper:
     @modal.enter()
     def load_modal(self):
         print("Loading models")
-        pass
+
+        self.whisperx_model = whisperx.load_model(
+            "large-v2", device="cuda", compute_type="float16")
+
+        self.whisperx_alignment_model, self.metadata = whisperx.load_align_model(
+            language_code="en", device="cuda", compute_type="float16"
+        )
+        print("Models loaded successfully")
+
+    def transcribe_video(self, base_dir: str, video_path: str) -> str:
+        audio_path = base_dir / "audio.wav"
+        extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        subprocess.run(extract_cmd, shell=True,
+                       check=True, capture_output=True)
+
+        start_time = time.time()
+
+        audio = whisperx.load_audio(str(audio_path))
+        result = self.whisperx_model.transcribe(
+            audio, batch_size=16)
+
+        result = whisperx.align(
+            result["segments"],
+            self.alignment_model,
+            self.metadata,
+            audio,
+            device="cuda",
+            return_char_alignments=False
+        )
+
+        duration_time = time.time() - start_time
+        print("Transcription and alignment took " +
+              str(duration_time) + " seconds")
+
+        print(json.dumps(result, indent=2))
 
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
