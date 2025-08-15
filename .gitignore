@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Video / Audio files
+*.mp4
+*.mov
+*.avi
+*.wav
+*.mp3
+
+# Large data
+*.zip
+*.tar
+*.tar.gz
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
