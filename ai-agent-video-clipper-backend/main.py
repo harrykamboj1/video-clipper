@@ -1,6 +1,8 @@
 import json
 import os
 import pathlib
+import pickle
+import shutil
 import subprocess
 import time
 import uuid
@@ -115,6 +117,80 @@ class AiPodcastClipper:
 
         return json.dumps(segments)
 
+    def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
+        clip_name = f"clip_{clip_index}"
+        s3_key_dir = os.path.dirname(s3_key)
+        output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
+        print(f"Output S3 key: {output_s3_key}")
+
+        clip_dir = base_dir / clip_name
+        clip_dir.mkdir(parents=True, exist_ok=True)
+
+        clip_segment_path = clip_dir / f"{clip_name}_segment.mp4"
+        vertical_mp4_path = clip_dir / "pyavi" / "video_out_vertical.mp4"
+        subtitle_output_path = clip_dir / "pyavi" / "video_with_subtitles.mp4"
+
+        (clip_dir / "pywork").mkdir(exist_ok=True)
+        pyframes_path = clip_dir / "pyframes"
+        pyavi_path = clip_dir / "pyavi"
+        audio_path = clip_dir / "pyavi" / "audio.wav"
+
+        pyframes_path.mkdir(exist_ok=True)
+        pyavi_path.mkdir(exist_ok=True)
+
+        duration = end_time - start_time
+        cut_command = (f"ffmpeg -i {original_video_path} -ss {start_time} -t {duration} "
+                       f"{clip_segment_path}")
+        subprocess.run(cut_command, shell=True, check=True,
+                       capture_output=True, text=True)
+
+        extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        subprocess.run(extract_cmd, shell=True,
+                       check=True, capture_output=True)
+
+        shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
+
+        columbia_command = (f"python Columbia_test.py --videoName {clip_name} "
+                            f"--videoFolder {str(base_dir)} "
+                            f"--pretrainModel weight/finetuning_TalkSet.model")
+
+        columbia_start_time = time.time()
+        subprocess.run(columbia_command, cwd="/asd", shell=True)
+        columbia_end_time = time.time()
+        print(
+            f"Columbia script completed in {columbia_end_time - columbia_start_time:.2f} seconds")
+
+        tracks_path = clip_dir / "pywork" / "tracks.pckl"
+        scores_path = clip_dir / "pywork" / "scores.pckl"
+        if not tracks_path.exists() or not scores_path.exists():
+            raise FileNotFoundError("Tracks or scores not found for clip")
+
+        with open(tracks_path, "rb") as f:
+            tracks = pickle.load(f)
+
+        with open(scores_path, "rb") as f:
+            scores = pickle.load(f)
+
+        cvv_start_time = time.time()
+        create_vertical_video(
+            tracks, scores, pyframes_path, pyavi_path, audio_path, vertical_mp4_path
+        )
+        cvv_end_time = time.time()
+        print(
+            f"Clip {clip_index} vertical video creation time: {cvv_end_time - cvv_start_time:.2f} seconds")
+
+        create_subtitles_with_ffmpeg(transcript_segments, start_time,
+                                     end_time, vertical_mp4_path, subtitle_output_path, max_words=5)
+
+        s3_client = boto3.client(
+            service_name='s3',
+            aws_access_key_id=os.environ["CLOUDFLARE_ACCESS_KEY"],
+            aws_secret_access_key=os.environ["CLOUDFLARE_SECRET_KEY"],
+            endpoint_url=os.environ["R2_END_POINT"],
+        )
+        s3_client.upload_file(
+            subtitle_output_path, "ai-podcast-clipper", output_s3_key)
+
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
         print(f"Processing Video {request.s3_key}")
@@ -143,8 +219,36 @@ class AiPodcastClipper:
         client.download_file(
             "videoclipper", request.s3_key, str(video_path))
 
-        self.transcribe_video(base_dir, video_path)
-        return {"status": "success", "video_path": str(video_path)}
+        transcripts_segments_json = self.transcribe_video(base_dir, video_path)
+        transcripts_segments = json.loads(transcripts_segments_json)
+
+        print(f"Transcripts segments: {transcripts_segments}")
+        print("Identifying moments in the transcript...")
+        identified_moments_json = self.identify_moments(transcripts_segments)
+
+        cleaned_json_string = identified_moments_json.strip()
+        if cleaned_json_string.startswith("```json"):
+            cleaned_json_string = cleaned_json_string[len("```json"):].strip()
+        if cleaned_json_string.endswith("```"):
+            cleaned_json_string = cleaned_json_string[:-len("```")].strip()
+
+        clip_moments = json.loads(cleaned_json_string)
+        if not clip_moments or not isinstance(clip_moments, list):
+            print("Error: Identified moments is not a list")
+            clip_moments = []
+
+        print(clip_moments)
+
+        for index, moment in enumerate(clip_moments[:5]):
+            if "start" in moment and "end" in moment:
+                print("Processing clip" + str(index) + " from " +
+                      str(moment["start"]) + " to " + str(moment["end"]))
+                process_clip(base_dir, video_path, s3_key,
+                             moment["start"], moment["end"], index, transcript_segments)
+
+        if base_dir.exists():
+            print(f"Cleaning up temp dir after {base_dir}")
+            shutil.rmtree(base_dir, ignore_errors=True)
 
 
 @app.local_entrypoint()
